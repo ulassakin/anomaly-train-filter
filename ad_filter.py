@@ -25,6 +25,7 @@ from sklearn.mixture import GaussianMixture
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
+from scipy.ndimage import binary_dilation, binary_closing
 
 warnings.filterwarnings("ignore")
 
@@ -114,15 +115,82 @@ def load_dinov2(device):
     return model
 
 
+def get_grid_dims(n_patches):
+    """
+    Find (rows, cols) for the patch grid given total patch count.
+    DINOv2 with patch_size=14 on a square image of size S gives
+    grid = (S // 14) x (S // 14) patches. But different categories
+    may use different image sizes, so we find the closest square
+    factorisation rather than assuming sqrt is exact.
+    """
+    side = int(np.sqrt(n_patches))
+    # Try side x side first (perfect square)
+    if side * side == n_patches:
+        return side, side
+    # Try side x (side+1) and (side+1) x side
+    if side * (side + 1) == n_patches:
+        return side, side + 1
+    if (side + 1) * side == n_patches:
+        return side + 1, side
+    # Fallback: trim to nearest perfect square
+    return side, side
+
+
+def compute_foreground_mask(patch_features):
+    """
+    Compute a foreground mask using the first PCA component of patch features.
+    This is exactly the AnomalyDINO masking approach — no extra model needed,
+    DINOv2 patch features separate foreground/background in their first PC.
+
+    Steps:
+      1. PCA on patch features → take first component
+      2. Reshape into spatial grid (handles non-square grids)
+      3. Threshold at mean to get binary mask
+      4. Ensure foreground is the center (not background) — flip if needed
+      5. Apply dilation + morphological closing to fill holes and gaps
+
+    Returns a boolean mask of shape (N_patches,) — True = foreground (keep)
+    """
+    n_patches = patch_features.shape[0]
+    rows, cols = get_grid_dims(n_patches)
+    n_use = rows * cols  # may be less than n_patches if non-square fallback
+
+    # Step 1: first PCA component
+    pca_mask = PCA(n_components=1)
+    first_pc = pca_mask.fit_transform(patch_features[:n_use]).reshape(rows, cols)
+
+    # Step 2: threshold at mean
+    binary = first_pc > first_pc.mean()
+
+    # Step 3: ensure center is foreground — flip if needed
+    cr, cc = rows // 4, cols // 4
+    center = binary[cr:-cr, cc:-cc]
+    if center.mean() < 0.5:
+        binary = ~binary
+
+    # Step 4: morphological cleanup
+    binary = binary_dilation(binary, iterations=2)
+    binary = binary_closing(binary, iterations=2)
+
+    # Build final mask — any trimmed patches default to True (keep)
+    mask = np.ones(n_patches, dtype=bool)
+    mask[:n_use] = binary.reshape(-1)
+    return mask
+
+
 @torch.no_grad()
-def extract_features(model, dataloader, device):
+def extract_features(model, dataloader, device, use_mask=False):
     """
     Returns:
-        all_patch_features : (N_images, N_patches, D)  — one row of patches per image
+        all_patch_features : list of (N_patches, D) arrays — one per image
+                             If use_mask=True, background patches are zeroed
+                             and a separate mask list is returned
         all_paths          : list of str, length N_images
+        all_masks          : list of (N_patches,) boolean arrays (None if use_mask=False)
     """
     all_patch_features = []
     all_paths = []
+    all_masks = []
 
     for imgs, paths in tqdm(dataloader, desc="Extracting features"):
         imgs = imgs.to(device)
@@ -130,10 +198,18 @@ def extract_features(model, dataloader, device):
         patch_feats = feats[:, 1:, :].cpu().numpy()          # (B, N_patches, D)
 
         for i in range(len(paths)):
-            all_patch_features.append(patch_feats[i])        # (N_patches, D)
+            pf = patch_feats[i]   # (N_patches, D)
+
+            if use_mask:
+                mask = compute_foreground_mask(pf)
+                all_masks.append(mask)
+            else:
+                all_masks.append(None)
+
+            all_patch_features.append(pf)
             all_paths.append(paths[i])
 
-    return all_patch_features, all_paths
+    return all_patch_features, all_paths, all_masks
 
 
 # ─────────────────────────────────────────────
@@ -184,47 +260,53 @@ def fit_gmm_iterative(all_patch_features):
 # ─────────────────────────────────────────────
 # IMAGE-LEVEL SCORING
 # ─────────────────────────────────────────────
-def score_images(pca, gmm, all_patch_features, category):
+def score_images(pca, gmm, all_patch_features, all_masks, category):
     """
-    Two different scoring strategies depending on category type:
+    Scoring strategy depends on category type:
 
-    TEXTURES (carpet, grid, leather, tile, wood, zipper):
-      Fraction of anomalous patches strategy.
-      1. Score every patch across all images
-      2. Set a global threshold at the 90th percentile
-      3. Image score = fraction of its patches exceeding that threshold
-      Why: texture defects are spatially large (scratches, holes, stains)
-      and affect many patches. The fraction metric accumulates this evidence
-      and gives two tight, well-separated clusters to the final GMM.
+    TEXTURES (carpet, grid, leather, tile, wood):
+      No masking. Fraction of anomalous patches above global threshold.
+      Captures spatially spread defects (scratches, holes, stains).
 
-    OBJECTS (bottle, capsule, pill, etc.):
-      Top-1 max patch score strategy.
-      Image score = score of its single most anomalous patch.
-      Why: object defects are small and localized (a chip, a dent, a crack).
-      Only a few patches are affected but they score very high. Taking the
-      max ensures one clearly wrong patch is enough to flag the image.
+    OBJECTS with masking (capsule, hazelnut, pill, screw, toothbrush):
+      Apply foreground mask — ignore background patches entirely.
+      Then top-1 max patch score on foreground patches only.
+      Masking removes the background noise that was drowning out defect signal.
+
+    OBJECTS without masking (bottle, cable, metal_nut, transistor, zipper):
+      DINOv2 masking fails for these (per AnomalyDINO paper).
+      Fall back to top-1 max patch score on all patches.
     """
     if category in TEXTURE_CATEGORIES:
         print(f"  Scoring strategy: fraction of anomalous patches  (texture mode)")
 
-        # Step 1: score all patches globally
         all_patch_scores = []
         for patch_features in all_patch_features:
             reduced = pca.transform(patch_features)
             patch_scores = -gmm.score_samples(reduced)
             all_patch_scores.append(patch_scores)
 
-        # Step 2: global threshold at 90th percentile
         patch_threshold = np.percentile(np.concatenate(all_patch_scores), PATCH_ANOMALY_PCTILE)
         print(f"  Patch anomaly threshold (p{PATCH_ANOMALY_PCTILE}): {patch_threshold:.3f}")
 
-        # Step 3: image score = fraction of patches above threshold
         image_scores = []
         for patch_scores in all_patch_scores:
             image_scores.append((patch_scores > patch_threshold).mean())
 
+    elif category in MASK_CATEGORIES:
+        print(f"  Scoring strategy: top-1 max patch score + foreground mask  (object mode)")
+
+        image_scores = []
+        for patch_features, mask in zip(all_patch_features, all_masks):
+            reduced = pca.transform(patch_features)
+            patch_scores = -gmm.score_samples(reduced)
+            # Only consider foreground patches
+            fg_scores = patch_scores[mask] if mask.sum() > 0 else patch_scores
+            image_scores.append(fg_scores.max())
+
     else:
-        print(f"  Scoring strategy: top-1 max patch score  (object mode)")
+        # NO_MASK_CATEGORIES — masking fails, use all patches
+        print(f"  Scoring strategy: top-1 max patch score  (object mode, no mask)")
 
         image_scores = []
         for patch_features in all_patch_features:
@@ -244,16 +326,23 @@ MVTEC_CATEGORIES = [
     "pill", "screw", "toothbrush", "transistor", "zipper", # objects
 ]
 
-# Texture categories have spread-out defects → fraction of anomalous patches
-# Object categories have localized defects   → single worst patch (top-1 max)
-TEXTURE_CATEGORIES   = {"carpet", "grid", "leather", "tile", "wood", "zipper"}
+# Texture categories: spread-out defects, no masking needed
+# Object categories:  localized defects, mask out background
+# Some object categories fail the DINOv2 masking test (per AnomalyDINO paper Table 8)
+TEXTURE_CATEGORIES = {"carpet", "grid", "leather", "tile", "wood"}
+MASK_CATEGORIES    = {"capsule", "hazelnut", "pill", "screw", "toothbrush"}  # masking works
+NO_MASK_CATEGORIES = {"bottle", "cable", "metal_nut", "transistor", "zipper"}  # masking fails
 PATCH_ANOMALY_PCTILE = 90   # threshold percentile for texture fraction scoring
+
+# Brightness normalization helps categories with lighting variation (e.g. carpet)
+# but hurts categories with uniform, consistent lighting (e.g. grid)
+BRIGHTNESS_NORM_CATEGORIES = {"carpet", "leather", "tile", "wood"}
 
 
 # ─────────────────────────────────────────────
 # PER-CATEGORY LOGIC
 # ─────────────────────────────────────────────
-def run_category(category, data_root, out_dir, model, transform, device):
+def run_category(category, data_root, out_dir, model, device):
     print(f"\n{'='*55}")
     print(f"  Category: {category}")
     print(f"{'='*55}")
@@ -262,12 +351,36 @@ def run_category(category, data_root, out_dir, model, transform, device):
     print("[1/4] Loading training images ...")
     paths, gt_labels = load_training_images(data_root, category)
 
+    # Build transform — brightness normalization only for categories
+    # where lighting variation is a known source of false positives.
+    # Grid has very consistent lighting so normalization hurts it.
+    base_transforms = [
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+    ]
+    if category in BRIGHTNESS_NORM_CATEGORIES:
+        base_transforms.append(
+            transforms.Lambda(lambda x: x * (0.5 / (x.mean() + 1e-6)))
+        )
+        print(f"  Brightness normalization: ON")
+    else:
+        print(f"  Brightness normalization: OFF")
+    base_transforms.append(
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    )
+    transform = transforms.Compose(base_transforms)
+
     dataset = ImageFolderDataset(paths, transform)
     loader  = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
 
     # 2. Extract features
     print("\n[2/4] Extracting DINOv2 patch features ...")
-    all_patch_features, all_paths = extract_features(model, loader, device)
+    use_mask = category in MASK_CATEGORIES
+    all_patch_features, all_paths, all_masks = extract_features(model, loader, device, use_mask=use_mask)
+    if use_mask:
+        n_masked = sum(m.mean() for m in all_masks) / len(all_masks)
+        print(f"  Foreground mask applied — avg foreground: {100*n_masked:.1f}% of patches")
 
     # 3. Fit GMM
     print("\n[3/4] Fitting GMM (iterative trimming) ...")
@@ -275,7 +388,7 @@ def run_category(category, data_root, out_dir, model, transform, device):
 
     # 4. Score and split
     print("\n[4/4] Scoring images ...")
-    image_scores = score_images(pca, gmm, all_patch_features, category)
+    image_scores = score_images(pca, gmm, all_patch_features, all_masks, category)
 
     score_gmm = GaussianMixture(n_components=2, random_state=RANDOM_SEED)
     score_gmm.fit(image_scores.reshape(-1, 1))
@@ -340,13 +453,6 @@ def main(args):
     print(f"  Device     : {device}")
     print(f"{'='*55}")
 
-    transform = transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-
     # Load model once, reuse across all categories
     print("\nLoading DINOv2 (once for all categories) ...")
     model = load_dinov2(device)
@@ -355,7 +461,7 @@ def main(args):
     results = []
     for category in categories:
         try:
-            r = run_category(category, data_root, out_dir, model, transform, device)
+            r = run_category(category, data_root, out_dir, model, device)
             results.append(r)
         except Exception as e:
             print(f"  ERROR on {category}: {e}")
