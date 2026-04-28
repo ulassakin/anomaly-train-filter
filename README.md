@@ -1,12 +1,12 @@
 # anomaly-train-filter
 
-A lightweight tool for cleaning contaminated training sets in unsupervised anomaly detection. Uses DINOv2 patch features and iterative GMM fitting to separate normal from anomalous images — no labels required. Evaluated on all 15 MVTec-AD categories.
+A lightweight tool for cleaning contaminated training sets in unsupervised anomaly detection, focused on textile and texture categories. Uses DINOv2 patch features and iterative GMM fitting to separate normal from anomalous images — no labels required. Evaluated on all 15 MVTec-AD categories.
 
 ---
 
 ## The Problem
 
-State-of-the-art unsupervised anomaly detection methods (e.g. [Dinomaly](https://arxiv.org/abs/2405.14529)) assume a **pure normal training set**. In real industrial deployments this assumption breaks — a camera mounted above a factory conveyor belt will inevitably capture some defective products during the data collection phase, contaminating the training data with anomalies.
+State-of-the-art unsupervised anomaly detection methods (e.g. [Dinomaly](https://arxiv.org/abs/2405.14529)) assume a **pure normal training set**. In real industrial deployments this assumption breaks — a camera mounted above a factory conveyor belt will inevitably capture some defective products during the data collection phase, contaminating the training data with anomalies. This is particularly relevant for textile manufacturing, where a camera above a conveyor belt captures both normal and defective fabric during data collection.
 
 Training on contaminated data causes the model to learn defects as normal, directly hurting detection performance at inference time.
 
@@ -32,8 +32,7 @@ Contaminated training set
 [3] Score each image
     Textures → fraction of anomalous patches
                (defects are spatially spread, fraction captures cumulative evidence)
-    Objects  → max patch score (top-1)
-               (defects are localized, one outlier patch is enough)
+    
         │
         ▼
 [4] Fit 2-component GMM on image scores
@@ -79,7 +78,7 @@ python filter.py --data_root /path/to/mvtec --category carpet
 python filter.py --data_root /path/to/mvtec --category carpet,grid,leather
 ```
 
-**All 15 MVTec-AD categories:**
+**All 5 MVTec-AD categories:**
 ```bash
 python filter.py --data_root /path/to/mvtec --category all
 ```
@@ -112,16 +111,6 @@ Evaluated with 10% contamination (injected from test defect folders). Recall mea
 | leather | 245 | 27 | 27 | 13 | 1.00 | 0.68 | 0.81 |
 | tile | 230 | 25 | 25 | 3 | 1.00 | 0.89 | 0.94 |
 | wood | 247 | 27 | 25 | 21 | 0.93 | 0.54 | 0.68 |
-| bottle | — | — | — | — | — | — | — |
-| cable | — | — | — | — | — | — | — |
-| capsule | — | — | — | — | — | — | — |
-| hazelnut | — | — | — | — | — | — | — |
-| metal_nut | — | — | — | — | — | — | — |
-| pill | — | — | — | — | — | — | — |
-| screw | — | — | — | — | — | — | — |
-| toothbrush | — | — | — | — | — | — | — |
-| transistor | — | — | — | — | — | — | — |
-| zipper | — | — | — | — | — | — | — |
 | **Average** | | | | **—** | **—** | **—** | **—** |
 
 > Results will be filled in after full evaluation run.
@@ -153,6 +142,8 @@ mvtec/
 ## Context
 
 This tool is **Stage 1 of a larger research pipeline** for unsupervised anomaly detection under real factory conditions. The cleaned training set produced here is intended to be fed into [Dinomaly](https://arxiv.org/abs/2405.14529) for the actual defect detection model.
+
+Texture categories are the primary focus because they match the target deployment scenario (fabric inspection) and because the GMM scoring strategy — fraction of anomalous patches — is well-suited to spatially distributed defects. Object categories require foreground masking and localized scoring, which are out of scope for this tool.
 
 The full pipeline is under active development.
 
