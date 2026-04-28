@@ -107,7 +107,7 @@ Evaluated with 10% contamination (injected from test defect folders). Recall mea
 
 | Category | Injected | Caught | FP | Recall | Precision | F1 |
 |---|---|---|---|---|---|---|
-| carpet | — | — | — | — | — | — |
+| carpet | 31 | 31 | 15 | 1.00 | 0.67 | 0.81 |
 | grid | — | — | — | — | — | — |
 | leather | — | — | — | — | — | — |
 | tile | — | — | — | — | — | — |
