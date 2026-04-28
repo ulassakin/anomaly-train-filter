@@ -106,7 +106,7 @@ For each category, two files are saved to `output_dir`:
 Evaluated with 10% contamination (injected from test defect folders). Recall measures what fraction of injected defects were correctly flagged. Precision measures what fraction of flagged images were actually defective.
 
 | Category | Normal Images | Injected | Caught | FP | Recall | Precision | F1 |
-|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|---|
 | carpet | 280 | 31 | 31 | 15 | 1.00 | 0.67 | 0.81 |
 | grid | — | — | — | — | — | — | — |
 | leather | — | — | — | — | — | — | — |
@@ -122,7 +122,7 @@ Evaluated with 10% contamination (injected from test defect folders). Recall mea
 | toothbrush | — | — | — | — | — | — | — |
 | transistor | — | — | — | — | — | — | — |
 | zipper | — | — | — | — | — | — | — |
-| **Average** | | | | **—** | **—** | **—** |
+| **Average** | | | | **—** | **—** | **—** | **—** |
 
 > Results will be filled in after full evaluation run.
 
