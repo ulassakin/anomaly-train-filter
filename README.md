@@ -108,10 +108,10 @@ Evaluated with 10% contamination (injected from test defect folders). Recall mea
 | Category | Normal Images | Injected | Caught | FP | Recall | Precision | F1 |
 |---|---|---|---|---|---|---|---|
 | carpet | 280 | 31 | 31 | 15 | 1.00 | 0.67 | 0.81 |
-| grid | — | — | — | — | — | — | — |
-| leather | — | — | — | — | — | — | — |
-| tile | — | — | — | — | — | — | — |
-| wood | — | — | — | — | — | — | — |
+| grid | 264 | 29 | 29 | 11 | 1.00 | 0.72 | 0.84 |
+| leather | 245 | 27 | 27 | 13 | 1.00 | 0.68 | 0.81 |
+| tile | 230 | 25 | 25 | 3 | 1.00 | 0.89 | 0.94 |
+| wood | 247 | 27 | 25 | 21 | 0.93 | 0.54 | 0.68 |
 | bottle | — | — | — | — | — | — | — |
 | cable | — | — | — | — | — | — | — |
 | capsule | — | — | — | — | — | — | — |
