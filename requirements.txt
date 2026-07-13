@@ -2,6 +2,11 @@ torch
 torchvision
 timm
 scikit-learn
+scipy
+scikit-image
 numpy
 Pillow
 tqdm
+joblib
+matplotlib
+diptest
