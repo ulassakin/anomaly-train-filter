@@ -1,24 +1,23 @@
 """
 Stage 1: Separate normal vs. anomalous images from contaminated training data.
-Textile categories only: carpet, grid, leather, tile, wood.
 
 What this does:
   1. Load all training images (contaminated — mix of normal + some defective)
   2. Extract DINOv2 patch features for each image
   3. Fit PCA + GMM on all patch features (iterative trimming to handle contamination)
-  4. Score each image by the fraction of its patches that score above an anomaly threshold
-  5. Split into normal / anomalous using a second GMM on the image scores
-  6. Save two lists: {category}_normal_paths.txt and {category}_anomalous_paths.txt
+  4. Score each IMAGE by aggregating its patch scores (mean of top-k worst patches)
+  5. Threshold: bottom X% of images = normal, top = anomalous
+  6. Save two lists: normal_paths.txt and anomalous_paths.txt
 
 Usage:
-    python ad_filter.py --data_root /path/to/mvtec --category carpet
-    python ad_filter.py --data_root /path/to/mvtec --category all
+    python gmm_stage1.py --data_root /path/to/mvtec --category carpet
 """
 
 import argparse
 import warnings
 from pathlib import Path
 
+import joblib
 import numpy as np
 import torch
 from PIL import Image
@@ -27,28 +26,20 @@ from sklearn.mixture import GaussianMixture
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
+from scipy.ndimage import binary_dilation, binary_closing
 
 warnings.filterwarnings("ignore")
-
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-DINO_MODEL           = "vit_small_patch14_dinov2.lvd142m"
-IMG_SIZE             = 518
-PCA_DIM              = 64
-GMM_COMPONENTS       = 9
-TRIM_PERCENTILE      = 85   # Keep bottom X% of patches each trimming round
-TRIM_ITERATIONS      = 3    # Number of GMM refitting rounds
-PATCH_ANOMALY_PCTILE = 90   # Patch score percentile used as anomaly threshold
+DINO_MODEL      = "vit_small_patch14_dinov2.lvd142m"
+IMG_SIZE        = 518
+PCA_DIM         = 64
+GMM_COMPONENTS  = 9
+TRIM_PERCENTILE      = 85   # During iterative trimming, keep bottom X% patches each round
+TRIM_ITERATIONS      = 3    # How many refitting rounds
 RANDOM_SEED          = 42
-
-# All five textile categories
-TEXTILE_CATEGORIES = ["carpet", "grid", "leather", "tile", "wood"]
-
-# Brightness normalization reduces false positives caused by lighting variation.
-# Grid has very consistent, uniform lighting so normalization hurts it — excluded.
-BRIGHTNESS_NORM_CATEGORIES = {"carpet", "leather", "tile", "wood"}
 
 
 # ─────────────────────────────────────────────
@@ -82,10 +73,10 @@ class ImageFolderDataset(Dataset):
 
 def load_training_images(data_root: Path, category: str, contamination: float = 0.1):
     """
-    Builds a contaminated training set:
+    Automatically builds a contaminated training set:
       - Normal images from train/good
       - Defective images injected from test/ subfolders (~10% by default)
-    Also returns ground truth labels so separation quality can be evaluated.
+    Also returns ground truth labels so you can evaluate separation quality.
     """
     train_dir = data_root / category / "train" / "good"
     test_dir  = data_root / category / "test"
@@ -125,28 +116,101 @@ def load_dinov2(device):
     return model
 
 
-@torch.no_grad()
-def extract_features(model, dataloader, device):
+def get_grid_dims(n_patches):
     """
-    Extracts DINOv2 patch features for every image in the dataloader.
+    Find (rows, cols) for the patch grid given total patch count.
+    DINOv2 with patch_size=14 on a square image of size S gives
+    grid = (S // 14) x (S // 14) patches. But different categories
+    may use different image sizes, so we find the closest square
+    factorisation rather than assuming sqrt is exact.
+    """
+    side = int(np.sqrt(n_patches))
+    # Try side x side first (perfect square)
+    if side * side == n_patches:
+        return side, side
+    # Try side x (side+1) and (side+1) x side
+    if side * (side + 1) == n_patches:
+        return side, side + 1
+    if (side + 1) * side == n_patches:
+        return side + 1, side
+    # Fallback: trim to nearest perfect square
+    return side, side
 
+
+def compute_foreground_mask(patch_features):
+    """
+    Compute a foreground mask using the first PCA component of patch features.
+    This is exactly the AnomalyDINO masking approach — no extra model needed,
+    DINOv2 patch features separate foreground/background in their first PC.
+
+    Steps:
+      1. PCA on patch features → take first component
+      2. Reshape into spatial grid (handles non-square grids)
+      3. Threshold at mean to get binary mask
+      4. Ensure foreground is the center (not background) — flip if needed
+      5. Apply dilation + morphological closing to fill holes and gaps
+
+    Returns a boolean mask of shape (N_patches,) — True = foreground (keep)
+    """
+    n_patches = patch_features.shape[0]
+    rows, cols = get_grid_dims(n_patches)
+    n_use = rows * cols  # may be less than n_patches if non-square fallback
+
+    # Step 1: first PCA component
+    pca_mask = PCA(n_components=1)
+    first_pc = pca_mask.fit_transform(patch_features[:n_use]).reshape(rows, cols)
+
+    # Step 2: threshold at mean
+    binary = first_pc > first_pc.mean()
+
+    # Step 3: ensure center is foreground — flip if needed
+    cr, cc = rows // 4, cols // 4
+    center = binary[cr:-cr, cc:-cc]
+    if center.mean() < 0.5:
+        binary = ~binary
+
+    # Step 4: morphological cleanup
+    binary = binary_dilation(binary, iterations=2)
+    binary = binary_closing(binary, iterations=2)
+
+    # Build final mask — any trimmed patches default to True (keep)
+    mask = np.ones(n_patches, dtype=bool)
+    mask[:n_use] = binary.reshape(-1)
+    return mask
+
+
+@torch.no_grad()
+def extract_features(model, dataloader, device, use_mask=False):
+    """
     Returns:
-        all_patch_features : list of (N_patches, D) arrays, one per image
-        all_paths          : list of str, one per image
+        all_patch_features : list of (N_patches, D) arrays — one per image
+                             If use_mask=True, background patches are zeroed
+                             and a separate mask list is returned
+        all_paths          : list of str, length N_images
+        all_masks          : list of (N_patches,) boolean arrays (None if use_mask=False)
     """
     all_patch_features = []
     all_paths = []
+    all_masks = []
 
     for imgs, paths in tqdm(dataloader, desc="Extracting features"):
         imgs = imgs.to(device)
         feats = model.get_intermediate_layers(imgs, n=1)[0]  # (B, N_patches+1, D)
-        patch_feats = feats[:, 1:, :].cpu().numpy()          # drop CLS token → (B, N_patches, D)
+        patch_feats = feats[:, 1:, :].cpu().numpy()          # (B, N_patches, D)
 
         for i in range(len(paths)):
-            all_patch_features.append(patch_feats[i])
+            pf = patch_feats[i]   # (N_patches, D)
+
+            if use_mask:
+                mask = compute_foreground_mask(pf)
+                all_masks.append(mask)
+            else:
+                all_masks.append(None)
+
+            all_patch_features.append(pf)
             all_paths.append(paths[i])
 
-    return all_patch_features, all_paths
+    return all_patch_features, all_paths, all_masks
 
 
 # ─────────────────────────────────────────────
@@ -154,29 +218,28 @@ def extract_features(model, dataloader, device):
 # ─────────────────────────────────────────────
 def fit_gmm_iterative(all_patch_features):
     """
-    Fits a GMM on patch features with iterative trimming to handle contamination:
-      - Round 1: fit on all patches
-      - Score all patches, discard the top (100 - TRIM_PERCENTILE)% highest scorers
-      - Rounds 2+: refit only on the surviving patches
-    Each round pushes anomalous patches further from the fitted distribution.
-
-    Returns:
-        pca      : fitted PCA object
-        gmm      : fitted GaussianMixture object
-        trim_mask: boolean array — True = patch kept in final fit
+    Fit GMM iteratively to handle contamination:
+      - Round 1: fit on everything
+      - Score all patches, discard top (100-TRIM_PERCENTILE)% highest-scoring ones
+      - Round 2+: refit on remaining patches only
+    This gradually pushes anomalous patches out of the fit.
     """
+    # Stack all patches into one big matrix
     flat_features = np.vstack(all_patch_features)  # (total_patches, D)
     print(f"  Total patches: {flat_features.shape[0]:,}  |  dim: {flat_features.shape[1]}")
 
+    # PCA once — fit on everything, don't refit each round
     print(f"  Fitting PCA ({flat_features.shape[1]}D → {PCA_DIM}D) ...")
     pca = PCA(n_components=PCA_DIM, random_state=RANDOM_SEED)
     reduced = pca.fit_transform(flat_features)
     print(f"  Explained variance: {pca.explained_variance_ratio_.cumsum()[-1]:.3f}")
 
+    # Iterative trimming
     mask = np.ones(len(reduced), dtype=bool)  # start: keep all patches
 
     for round_idx in range(TRIM_ITERATIONS):
-        print(f"  GMM round {round_idx + 1}/{TRIM_ITERATIONS}  ({mask.sum():,} patches kept) ...")
+        print(f"  GMM round {round_idx+1}/{TRIM_ITERATIONS}  "
+              f"({mask.sum():,} patches kept) ...")
         gmm = GaussianMixture(
             n_components=GMM_COMPONENTS,
             covariance_type="full",
@@ -185,60 +248,173 @@ def fit_gmm_iterative(all_patch_features):
         )
         gmm.fit(reduced[mask])
 
-        # Score ALL patches so the mask update is unbiased
-        scores = -gmm.score_samples(reduced)   # higher = more anomalous
+        # Score ALL patches (not just kept ones) so we can update the mask
+        scores = -gmm.score_samples(reduced)  # higher = more anomalous
         threshold = np.percentile(scores[mask], TRIM_PERCENTILE)
         mask = scores < threshold
 
-    print(f"  Final GMM fit on {mask.sum():,} patches  ({100 * mask.mean():.1f}% of total)")
+    print(f"  Final GMM fit on {mask.sum():,} patches  "
+          f"({100*mask.mean():.1f}% of total)")
     return pca, gmm, mask
 
 
 # ─────────────────────────────────────────────
-# IMAGE-LEVEL SCORING  (texture mode only)
+# IMAGE-LEVEL SCORING
 # ─────────────────────────────────────────────
-def score_images(pca, gmm, all_patch_features):
+def score_images(pca, gmm, all_patch_features, all_masks, category):
     """
-    Scores each image by the fraction of its patches that exceed a global
-    anomaly threshold. This is appropriate for textile / texture categories
-    where defects (scratches, holes, stains) are spatially spread across
-    the image rather than localized to one region.
+    Scoring strategy depends on category type:
 
-    Returns:
-        image_scores : (N_images,) array of floats in [0, 1]
+    TEXTURES (carpet, grid, leather, tile, wood):
+      No masking. Fraction of anomalous patches above global threshold.
+      Captures spatially spread defects (scratches, holes, stains).
+
+    OBJECTS with masking (capsule, hazelnut, pill, screw, toothbrush):
+      Apply foreground mask — ignore background patches entirely.
+      Then top-1 max patch score on foreground patches only.
+      Masking removes the background noise that was drowning out defect signal.
+
+    OBJECTS without masking (bottle, cable, metal_nut, transistor, zipper):
+      DINOv2 masking fails for these (per AnomalyDINO paper).
+      Fall back to top-1 max patch score on all patches.
     """
-    # Compute patch-level anomaly scores for every image
-    all_patch_scores = []
-    for patch_features in all_patch_features:
-        reduced = pca.transform(patch_features)
-        patch_scores = -gmm.score_samples(reduced)
-        all_patch_scores.append(patch_scores)
+    if category in TEXTURE_CATEGORIES:
+        print(f"  Scoring strategy: fraction of anomalous patches  (texture mode)")
 
-    # Global threshold: a patch is "anomalous" if it exceeds this percentile
-    patch_threshold = np.percentile(np.concatenate(all_patch_scores), PATCH_ANOMALY_PCTILE)
-    print(f"  Patch anomaly threshold (p{PATCH_ANOMALY_PCTILE}): {patch_threshold:.3f}")
+        all_patch_scores = []
+        for patch_features in all_patch_features:
+            reduced = pca.transform(patch_features)
+            patch_scores = -gmm.score_samples(reduced)
+            all_patch_scores.append(patch_scores)
 
-    # Image score = fraction of anomalous patches
-    image_scores = np.array([
-        (patch_scores > patch_threshold).mean()
-        for patch_scores in all_patch_scores
-    ])
-    return image_scores
+        patch_threshold = np.percentile(np.concatenate(all_patch_scores), PATCH_ANOMALY_PCTILE)
+        print(f"  Patch anomaly threshold (p{PATCH_ANOMALY_PCTILE}): {patch_threshold:.3f}")
+
+        image_scores = []
+        for patch_scores in all_patch_scores:
+            image_scores.append((patch_scores > patch_threshold).mean())
+
+    elif category in MASK_CATEGORIES:
+        print(f"  Scoring strategy: top-1 max patch score + foreground mask  (object mode)")
+
+        image_scores = []
+        for patch_features, mask in zip(all_patch_features, all_masks):
+            reduced = pca.transform(patch_features)
+            patch_scores = -gmm.score_samples(reduced)
+            # Only consider foreground patches
+            fg_scores = patch_scores[mask] if mask.sum() > 0 else patch_scores
+            image_scores.append(fg_scores.max())
+
+    else:
+        # NO_MASK_CATEGORIES — masking fails, use all patches
+        print(f"  Scoring strategy: top-1 max patch score  (object mode, no mask)")
+
+        image_scores = []
+        for patch_features in all_patch_features:
+            reduced = pca.transform(patch_features)
+            patch_scores = -gmm.score_samples(reduced)
+            image_scores.append(patch_scores.max())
+
+    return np.array(image_scores)
 
 
 # ─────────────────────────────────────────────
-# PER-CATEGORY PIPELINE
+# ALL MVTEC CATEGORIES
+# ─────────────────────────────────────────────
+MVTEC_CATEGORIES = [
+    "carpet", "grid", "leather", "tile", "wood",          # textures
+    "bottle", "cable", "capsule", "hazelnut", "metal_nut", # objects
+    "pill", "screw", "toothbrush", "transistor", "zipper", # objects
+]
+
+# Texture categories: spread-out defects, no masking needed
+# Object categories:  localized defects, mask out background
+# Some object categories fail the DINOv2 masking test (per AnomalyDINO paper Table 8)
+TEXTURE_CATEGORIES = {"carpet", "grid", "leather", "tile", "wood"}
+MASK_CATEGORIES    = {"capsule", "hazelnut", "pill", "screw", "toothbrush"}  # masking works
+NO_MASK_CATEGORIES = {"bottle", "cable", "metal_nut", "transistor", "zipper"}  # masking fails
+PATCH_ANOMALY_PCTILE = 90   # threshold percentile for texture fraction scoring
+
+# Brightness normalization helps categories with lighting variation (e.g. carpet)
+# but hurts categories with uniform, consistent lighting (e.g. grid)
+BRIGHTNESS_NORM_CATEGORIES = {"carpet", "leather", "tile", "wood"}
+
+
+
+# ─────────────────────────────────────────────
+# VALLEY THRESHOLD
+# ─────────────────────────────────────────────
+def find_valley_threshold(image_scores: np.ndarray,
+                           n_bins: int = 200,
+                           search_pctile: float = 50.0) -> float:
+    """
+    Finds the natural valley between the normal and anomalous image score
+    distributions without assuming Gaussian shapes.
+
+    Why this is better than a 2-component GMM:
+      The normal image score distribution has a long right tail — some normal
+      images score slightly higher due to fabric variation or lighting. A GMM
+      fits Gaussians to both sides and places its boundary ambiguously in that
+      tail. Valley detection instead finds the lowest-density point between
+      the two modes, which is exactly where a threshold should be.
+
+    Steps:
+      1. Build a smooth histogram of image scores (KDE via histogram + smoothing)
+      2. Search only in the upper half of scores (scores > 50th percentile)
+         — the valley must be above the bulk of normal images
+      3. Find the bin with minimum density in that search range
+      4. Return the score value at that bin as the threshold
+
+    In the degenerate case where no clear valley exists (all scores similar),
+    falls back to the 95th percentile — conservative but safe.
+    """
+    from scipy.ndimage import uniform_filter1d
+
+    # 1. Smooth histogram
+    counts, bin_edges = np.histogram(image_scores, bins=n_bins)
+    smoothed = uniform_filter1d(counts.astype(float), size=5)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    # 2. Search range: above the search_pctile of scores
+    search_start = np.percentile(image_scores, search_pctile)
+    search_mask  = bin_centers > search_start
+
+    if search_mask.sum() < 3:
+        # Fallback: no meaningful search range — use 95th percentile
+        print("  WARNING: no clear valley found — falling back to p95 threshold")
+        return float(np.percentile(image_scores, 95))
+
+    # 3. Find minimum density bin in search range
+    search_counts  = smoothed[search_mask]
+    search_centers = bin_centers[search_mask]
+    valley_idx     = np.argmin(search_counts)
+    threshold      = float(search_centers[valley_idx])
+
+    # Sanity check: threshold must be above at least 70% of scores
+    # (otherwise it's too low and will produce too many false positives)
+    min_threshold = float(np.percentile(image_scores, 70))
+    if threshold < min_threshold:
+        threshold = min_threshold
+        print(f"  Valley too low — raised to p70: {threshold:.4f}")
+
+    return threshold
+
+
+# ─────────────────────────────────────────────
+# PER-CATEGORY LOGIC
 # ─────────────────────────────────────────────
 def run_category(category, data_root, out_dir, model, device):
-    print(f"\n{'=' * 55}")
+    print(f"\n{'='*55}")
     print(f"  Category: {category}")
-    print(f"{'=' * 55}")
+    print(f"{'='*55}")
 
-    # 1. Load images
+    # 1. Load
     print("[1/4] Loading training images ...")
     paths, gt_labels = load_training_images(data_root, category)
 
-    # Build transform — brightness normalization on for categories with lighting variation
+    # Build transform — brightness normalization only for categories
+    # where lighting variation is a known source of false positives.
+    # Grid has very consistent lighting so normalization hurts it.
     base_transforms = [
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
@@ -261,31 +437,31 @@ def run_category(category, data_root, out_dir, model, device):
 
     # 2. Extract features
     print("\n[2/4] Extracting DINOv2 patch features ...")
-    all_patch_features, all_paths = extract_features(model, loader, device)
+    use_mask = category in MASK_CATEGORIES
+    all_patch_features, all_paths, all_masks = extract_features(model, loader, device, use_mask=use_mask)
+    if use_mask:
+        n_masked = sum(m.mean() for m in all_masks) / len(all_masks)
+        print(f"  Foreground mask applied — avg foreground: {100*n_masked:.1f}% of patches")
 
-    # 3. Fit GMM with iterative trimming
+    # 3. Fit GMM
     print("\n[3/4] Fitting GMM (iterative trimming) ...")
     pca, gmm, trim_mask = fit_gmm_iterative(all_patch_features)
 
-    # 4. Score images and split into normal / anomalous
+    # 4. Score and split
     print("\n[4/4] Scoring images ...")
-    image_scores = score_images(pca, gmm, all_patch_features)
+    image_scores = score_images(pca, gmm, all_patch_features, all_masks, category)
 
-    # Fit a 2-component GMM on image scores to find the natural split
-    score_gmm = GaussianMixture(n_components=2, random_state=RANDOM_SEED)
-    score_gmm.fit(image_scores.reshape(-1, 1))
+    threshold = find_valley_threshold(image_scores)
 
-    normal_component    = np.argmin(score_gmm.means_)
-    anomalous_component = np.argmax(score_gmm.means_)
-    assignments = score_gmm.predict(image_scores.reshape(-1, 1))
+    assignments = (image_scores > threshold).astype(int)
+    pred_normal    = [p for p, a in zip(all_paths, assignments) if a == 0]
+    pred_anomalous = [p for p, a in zip(all_paths, assignments) if a == 1]
 
-    pred_normal    = [p for p, a in zip(all_paths, assignments) if a == normal_component]
-    pred_anomalous = [p for p, a in zip(all_paths, assignments) if a == anomalous_component]
+    print(f"\n  Valley threshold      : {threshold:.4f}")
+    print(f"  Normal images         : {len(pred_normal)}")
+    print(f"  Anomalous images      : {len(pred_anomalous)}")
 
-    print(f"\n  Normal cluster mean   : {score_gmm.means_[normal_component][0]:.3f}")
-    print(f"  Anomalous cluster mean: {score_gmm.means_[anomalous_component][0]:.3f}")
-
-    # Evaluate against injected ground truth
+    # Evaluate
     pred_anomalous_set = set(pred_anomalous)
     total_injected  = sum(gt_labels)
     true_positives  = sum(1 for p, l in zip(all_paths, gt_labels) if l == 1 and p in pred_anomalous_set)
@@ -299,18 +475,25 @@ def run_category(category, data_root, out_dir, model, device):
           f"(caught {true_positives}/{total_injected}, fp={false_positives})")
 
     # Save path lists
-    (out_dir / f"{category}_normal_paths.txt").write_text("\n".join(pred_normal))
-    (out_dir / f"{category}_anomalous_paths.txt").write_text("\n".join(pred_anomalous))
+    (out_dir / f"{category}_normal_paths.txt").write_text("\n".join(str(p) for p in pred_normal))
+    (out_dir / f"{category}_anomalous_paths.txt").write_text("\n".join(str(p) for p in pred_anomalous))
+
+    # Save fitted PCA + GMM + threshold for inference and clustering
+    joblib.dump(
+        {"pca": pca, "gmm": gmm, "threshold": threshold},
+        out_dir / f"{category}_gmm.pkl"
+    )
+    print(f"  Saved model to: {out_dir}/{category}_gmm.pkl")
 
     return {
-        "category":        category,
-        "injected":        total_injected,
-        "true_positives":  true_positives,
-        "false_positives": false_positives,
-        "false_negatives": false_negatives,
-        "recall":          recall,
-        "precision":       precision,
-        "f1":              f1,
+        "category":       category,
+        "injected":       total_injected,
+        "true_positives": true_positives,
+        "false_positives":false_positives,
+        "false_negatives":false_negatives,
+        "recall":         recall,
+        "precision":      precision,
+        "f1":             f1,
     }
 
 
@@ -323,24 +506,23 @@ def main(args):
     out_dir   = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    categories = TEXTILE_CATEGORIES if args.category == "all" else \
-                 [c.strip() for c in args.category.split(",")]
+    # Decide which categories to run
+    if args.category == "all":
+        categories = MVTEC_CATEGORIES
+    else:
+        categories = [c.strip() for c in args.category.split(",")]
 
-    # Validate that only textile categories are requested
-    invalid = [c for c in categories if c not in TEXTILE_CATEGORIES]
-    if invalid:
-        raise ValueError(f"Non-textile categories requested: {invalid}. "
-                         f"Valid options: {TEXTILE_CATEGORIES}")
-
-    print(f"\n{'=' * 55}")
-    print(f"  Stage 1 — GMM Training Set Separation (Textile)")
+    print(f"\n{'='*55}")
+    print(f"  Stage 1 — GMM Training Set Separation")
     print(f"  Categories : {categories}")
     print(f"  Device     : {device}")
-    print(f"{'=' * 55}")
+    print(f"{'='*55}")
 
+    # Load model once, reuse across all categories
     print("\nLoading DINOv2 (once for all categories) ...")
     model = load_dinov2(device)
 
+    # Run
     results = []
     for category in categories:
         try:
@@ -350,32 +532,31 @@ def main(args):
             print(f"  ERROR on {category}: {e}")
 
     # Summary table
-    print("\n" + "=" * 70)
+    print("\n" + "="*70)
     print(f"  {'CATEGORY':<18} {'INJECTED':>8} {'CAUGHT':>7} {'FP':>5} {'RECALL':>7} {'PREC':>7} {'F1':>6}")
-    print("  " + "-" * 68)
+    print("  " + "-"*68)
     for r in results:
         print(f"  {r['category']:<18} {r['injected']:>8} {r['true_positives']:>7} "
               f"{r['false_positives']:>5} {r['recall']:>7.2f} {r['precision']:>7.2f} {r['f1']:>6.2f}")
     if len(results) > 1:
-        avg_recall    = sum(r["recall"]    for r in results) / len(results)
-        avg_precision = sum(r["precision"] for r in results) / len(results)
-        avg_f1        = sum(r["f1"]        for r in results) / len(results)
-        print("  " + "-" * 68)
-        print(f"  {'AVERAGE':<18} {'':>8} {'':>7} {'':>5} "
-              f"{avg_recall:>7.2f} {avg_precision:>7.2f} {avg_f1:>6.2f}")
-    print("=" * 70 + "\n")
-    print("  Done. Output saved to:", out_dir)
+        avg_recall    = sum(r['recall']    for r in results) / len(results)
+        avg_precision = sum(r['precision'] for r in results) / len(results)
+        avg_f1        = sum(r['f1']        for r in results) / len(results)
+        print("  " + "-"*68)
+        print(f"  {'AVERAGE':<18} {'':>8} {'':>7} {'':>5} {avg_recall:>7.2f} {avg_precision:>7.2f} {avg_f1:>6.2f}")
+    print("="*70 + "\n")
+
+    print("  Done. normal_paths.txt files saved to:", out_dir)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Stage 1: GMM-based training set cleaning for textile anomaly detection."
+        description="Stage 1: GMM-based training set cleaning for anomaly detection."
     )
     parser.add_argument("--data_root",   type=str, required=True,
                         help="Path to MVTec root directory")
     parser.add_argument("--category",    type=str, default="all",
-                        help="Textile category name, comma-separated list, or 'all' (default). "
-                             f"Valid: {TEXTILE_CATEGORIES}")
+                        help="Category name, comma-separated list, or 'all' (default)")
     parser.add_argument("--output_dir",  type=str, default="./stage1_output",
                         help="Where to save normal/anomalous path lists")
     args = parser.parse_args()
